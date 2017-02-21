@@ -59,6 +59,11 @@ public class RestoreNamespace {
                     Map<String, String> siMap = (Map<String, String>) storageInfo.get("map");
                     String path = siMap.get("path");
 
+                    String state = (String) storageInfo.get("state");
+                    if (!state.equals("PRECIOUS")) {
+                        continue;
+                    }
+
                     if (path == null) {
                         System.out.println("path is not available: " + entry.getKey());
                         continue;
