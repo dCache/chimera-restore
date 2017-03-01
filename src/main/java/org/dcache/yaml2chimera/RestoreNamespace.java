@@ -1,24 +1,29 @@
 package org.dcache.yaml2chimera;
 
-import com.esotericsoftware.yamlbeans.YamlException;
 import com.esotericsoftware.yamlbeans.YamlReader;
 import com.google.common.base.Splitter;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.FileReader;
-import java.io.IOException;
-import java.sql.SQLException;
+import java.sql.Connection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import javax.sql.DataSource;
+import liquibase.Liquibase;
+import liquibase.database.Database;
+import liquibase.database.DatabaseFactory;
+import liquibase.database.jvm.JdbcConnection;
+import liquibase.resource.ClassLoaderResourceAccessor;
 import org.dcache.chimera.ChimeraFsException;
 import org.dcache.chimera.FileExistsChimeraFsException;
-import org.dcache.chimera.FileSystemProvider;
-import org.dcache.chimera.FsFactory;
 import org.dcache.chimera.FsInode;
+import org.dcache.chimera.JdbcFs;
 import org.dcache.chimera.UnixPermission;
 import org.dcache.chimera.posix.Stat;
+import org.dcache.chimera.store.InodeStorageInformation;
 
 public class RestoreNamespace {
 
@@ -30,9 +35,11 @@ public class RestoreNamespace {
         public int uid;
         public int gid;
         public long size;
+        public String sGroup;
+        public String hsm;
     }
 
-    public static void main(String[] args) throws FileNotFoundException, YamlException, ChimeraFsException, SQLException, IOException {
+    public static void main(String[] args) throws Exception {
 
         if (args.length != 5) {
             System.err.println("Usage: RestoreNamespace <dump file name> <tsm|yaml> <jdbc-url> <db-user> <db-path>");
@@ -45,7 +52,43 @@ public class RestoreNamespace {
         String dbUser = args[3];
         String dbPass = args[4];
 
-        FileSystemProvider fs = FsFactory.createFileSystem(dbUrl, dbUser, dbPass);
+
+        String dbDrv;
+        String dialect;
+        String[] s = dbUrl.split(":");
+
+        switch(s[1]) {
+            case "h2":
+                dbDrv = "org.h2.Driver";
+                dialect = "H2";
+                break;
+            case "postgresql":
+                dbDrv = "org.postgresql.Driver";
+                dialect = "PgSQL";
+                break;
+            default:
+                throw new IllegalArgumentException("Unsuported db url: " + dbUrl);
+        }
+
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(dbUrl);
+        config.setUsername(dbUser);
+        config.setPassword(dbPass);
+        config.setDriverClassName(dbDrv);
+        config.setMaximumPoolSize(3);
+
+        DataSource dataSource = new HikariDataSource(config);
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+
+            Database database = DatabaseFactory.getInstance().findCorrectDatabaseImplementation(new JdbcConnection(conn));
+            Liquibase liquibase = new Liquibase("org/dcache/chimera/changelog/changelog-master.xml",
+                    new ClassLoaderResourceAccessor(), database);
+            liquibase.update("");
+        }
+
+        JdbcFs fs = new JdbcFs(dataSource, dialect);
 
         switch (type) {
 
@@ -88,6 +131,8 @@ public class RestoreNamespace {
                     } catch (NumberFormatException e) {
                     }
                     fr.csum = siMap.get("flag-c");
+                    // as we filter PRECIUOS files only, ignore storage class as it recorded on flush
+                    //fr.sGroup = (String)storageInfo.get("storageclass");
 
                     createEntry0(fs, fr);
                 }
@@ -104,6 +149,11 @@ public class RestoreNamespace {
 
                     List<String> record = splitter.splitToList(line);
                     System.out.println(record);
+                    if (record.size() < 8 || !record.get(7).startsWith("-si=")) {
+                        System.err.println("Skip invalid record: " + record);
+                        continue;
+                    }
+
                     Map<String, String> siMap = Splitter.on(';')
                             .trimResults()
                             .omitEmptyStrings()
@@ -113,6 +163,8 @@ public class RestoreNamespace {
                     FileRecord fr = new FileRecord();
                     fr.path = siMap.get("path");
                     fr.pnfsid = record.get(5);
+                    fr.sGroup = siMap.get("sClass");
+                    fr.hsm = siMap.get("hsm");
 
                     try {
                         fr.uid = Integer.parseInt(siMap.get("uid"));
@@ -143,7 +195,7 @@ public class RestoreNamespace {
 
     static Map<String, FsInode> parentCache = new HashMap<>();
 
-    static FsInode getOrCreateParent(FileSystemProvider fs, String path) throws ChimeraFsException {
+    static FsInode getOrCreateParent(JdbcFs fs, String path) throws ChimeraFsException {
 
         FsInode inode = parentCache.get(path);
         if (inode != null) {
@@ -158,7 +210,7 @@ public class RestoreNamespace {
             try {
                 inode = fs.mkdir(inode, pe, 0, 0, 0755);
             } catch (FileExistsChimeraFsException e) {
-                inode = fs.inodeOf(inode, pe, FileSystemProvider.StatCacheOption.NO_STAT);
+                inode = fs.inodeOf(inode, pe);
             }
         }
 
@@ -166,24 +218,49 @@ public class RestoreNamespace {
         return inode;
     }
 
-    static void createEntry0(FileSystemProvider fs, FileRecord fr) throws ChimeraFsException {
+    static void createEntry0(JdbcFs fs, FileRecord fr) throws ChimeraFsException {
         System.out.println(
                 String.format("create: %s -> %s %d %d %d %s", fr.pnfsid, fr.path, fr.uid, fr.gid, fr.size, fr.csum)
         );
         createEntry(fs, fr);
     }
 
-    static void createEntry(FileSystemProvider fs, FileRecord fr) throws ChimeraFsException {
+    static void createEntry(JdbcFs fs, FileRecord fr) throws ChimeraFsException {
+
+        if (fr.path == null) {
+            System.err.println("No path for: " + fr.pnfsid);
+            return;
+        }
 
         File f = new File(fr.path);
         File parent = f.getParentFile();
 
         FsInode pInode = getOrCreateParent(fs, parent.getAbsolutePath());
-        fs.createFileWithId(pInode, fr.pnfsid, f.getName(), fr.uid, fr.gid, 0644, UnixPermission.S_IFREG);
-        FsInode inode = fs.id2inode(fr.pnfsid, FileSystemProvider.StatCacheOption.NO_STAT);
+        FsInode inode = new FsInode(fs, fr.pnfsid);
+        if (inode.exists()) {
+            // duplicate entry
+            return;
+        }
+
+        try {
+            fs.createFileWithId(pInode, inode, f.getName(), fr.uid, fr.gid, 0644, UnixPermission.S_IFREG);
+        }catch (FileExistsChimeraFsException e) {
+            System.err.println("Conflicting name: " + f.getName());
+            // name conflict. can be due to partial upload on to multiple pools
+            fs.createFileWithId(pInode, inode, f.getName() + "_conflict_" + fr.pnfsid, fr.uid, fr.gid, 0644, UnixPermission.S_IFREG);
+        }
+
         Stat stat = new Stat();
         stat.setSize(fr.size);
         fs.setInodeAttributes(inode, 0, stat);
+        if (fr.sGroup != null) {
+            String[] s = fr.sGroup.split(":");
+            InodeStorageInformation si = new InodeStorageInformation(inode, fr.hsm, s[0], s[1]);
+            fs.setStorageInfo(inode, si);
+            fs.addInodeLocation(inode, 0,
+                    String.format("osm://lofar.psnc.pl/?store=%s&group=%s&bfid=%s", s[0], s[1], fr.pnfsid)
+                    );
+        }
 
         if (fr.csum != null && !fr.csum.isEmpty()) {
             String[] s = fr.csum.split(":");
