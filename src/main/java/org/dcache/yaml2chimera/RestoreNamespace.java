@@ -250,6 +250,9 @@ public class RestoreNamespace {
             fs.createFileWithId(pInode, inode, f.getName() + "_conflict_" + fr.pnfsid, fr.uid, fr.gid, 0644, UnixPermission.S_IFREG);
         }
 
+        // update lavel2 to inform that file was stored
+        fs.write(inode, 2, 0, new byte[]{'\n'}, 0, 1);
+
         Stat stat = new Stat();
         stat.setSize(fr.size);
         fs.setInodeAttributes(inode, 0, stat);
